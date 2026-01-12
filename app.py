@@ -10,7 +10,7 @@ import streamlit as st
 
 from openai import OpenAI
 
-# Optional: saubere Exception-Typen (falls vorhanden)
+# Optional: saubere Exception-Typen (je nach SDK-Version verfügbar)
 try:
     from openai import AuthenticationError, RateLimitError, APIError, BadRequestError
 except Exception:  # pragma: no cover
@@ -43,7 +43,7 @@ def ensure_audit_header():
                 w = csv.writer(f)
                 w.writerow(["timestamp", "user_name", "model", "rows_count", "result", "error_type"])
         except Exception:
-            # nicht crashen, nur später warnen
+            # Nicht crashen, nur später warnen
             pass
 
 
@@ -61,8 +61,7 @@ def read_audit_df() -> pd.DataFrame:
     if not os.path.exists(AUDIT_FILE):
         return pd.DataFrame(columns=["timestamp", "user_name", "model", "rows_count", "result", "error_type"])
     try:
-        df = pd.read_csv(AUDIT_FILE)
-        return df
+        return pd.read_csv(AUDIT_FILE)
     except Exception:
         return pd.DataFrame(columns=["timestamp", "user_name", "model", "rows_count", "result", "error_type"])
 
@@ -80,8 +79,7 @@ def rate_limit_ok(user_name: str) -> (bool, int):
 
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=60)
     recent = df[(df["user_name"] == user_name) & (df["timestamp"] >= cutoff)]
-    # Wir zählen Versuche, die "Empfehlung berechnen" ausgelöst haben (OK oder ERROR)
-    used = len(recent)
+    used = len(recent)  # zählt OK + ERROR als Versuch
     return used < MAX_PER_60MIN, used
 
 
@@ -101,16 +99,8 @@ def validate_and_clean(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df[EXPECTED_COLS]
 
-    # Monat: versuchen in Datum zu parsen (falls möglich), sonst als Text lassen
-    month_raw = df["month"].astype(str).str.strip()
-    month_dt = pd.to_datetime(month_raw, errors="coerce", utc=False)
-    # Wenn genug Werte parsebar sind, nutzen wir datetime zum Sortieren, sonst Text
-    if month_dt.notna().mean() >= 0.6:
-        df["month"] = month_dt
-        sort_key = "month"
-    else:
-        df["month"] = month_raw
-        sort_key = "month"
+    # month immer als Text speichern (Data Editor ist dann stabil)
+    df["month"] = df["month"].astype(str).str.strip()
 
     # Numerische Spalten
     for c in NUM_COLS:
@@ -120,11 +110,13 @@ def validate_and_clean(df: pd.DataFrame) -> pd.DataFrame:
     if df[NUM_COLS].isna().any().any():
         st.warning("Hinweis: Einige Zahlen konnten nicht gelesen werden (leer/ungültig). Bitte im Data Editor korrigieren.")
 
-    # Sortieren
-    try:
-        df = df.sort_values(by=sort_key, ascending=True)
-    except Exception:
-        pass
+    # Sortierung: wenn month wie Datum aussieht, sortiere danach
+    month_dt = pd.to_datetime(df["month"], errors="coerce")
+    if month_dt.notna().mean() >= 0.6:
+        df["_month_dt"] = month_dt
+        df = df.sort_values(by="_month_dt", ascending=True).drop(columns=["_month_dt"])
+    else:
+        df = df.sort_values(by="month", ascending=True)
 
     df = df.reset_index(drop=True)
 
@@ -154,7 +146,11 @@ def compute_kpis(df: pd.DataFrame) -> dict:
 
     # Kostenquote (letzter Monat)
     last_rev = float(last["revenue"]) if pd.notna(last["revenue"]) else float("nan")
-    last_costs = float(last["fixed_costs"] + last["variable_costs"]) if pd.notna(last["fixed_costs"]) and pd.notna(last["variable_costs"]) else float("nan")
+    if pd.notna(last["fixed_costs"]) and pd.notna(last["variable_costs"]):
+        last_costs = float(last["fixed_costs"] + last["variable_costs"])
+    else:
+        last_costs = float("nan")
+
     if pd.notna(last_rev) and last_rev != 0 and pd.notna(last_costs):
         cost_ratio = last_costs / last_rev
     else:
@@ -199,27 +195,12 @@ def fmt_pct(x) -> str:
 
 
 def month_to_label(m):
-    if isinstance(m, pd.Timestamp):
-        # z.B. 2026-01-01 -> 2026-01
-        return m.strftime("%Y-%m")
     return str(m)
 
 
 def build_prompt(df: pd.DataFrame, k: dict) -> str:
-    # Kompakt: KPIs + letzte 6 Zeilen als Mini-Tabelle
     last_n = df.tail(6).copy()
-
-    # month human-readable
-    last_n["month"] = last_n["month"].apply(month_to_label)
-
     csv_preview = last_n.to_csv(index=False)
-
-    avg_profit = k["avg_profit"]
-    runway = k["runway"]
-    cost_ratio = k["cost_ratio"]
-    rev_per_emp = k["rev_per_emp"]
-    rev_growth = k["rev_growth"]
-    last_cash = k["last_cash"]
 
     return f"""
 Du bist ein erfahrener CFO-Berater. Antworte auf Deutsch, klar und direkt.
@@ -227,12 +208,12 @@ Du bist ein erfahrener CFO-Berater. Antworte auf Deutsch, klar und direkt.
 Ziel: Erzeuge eine Management-Empfehlung basierend auf den Finanzdaten (Monate).
 
 KPIs (aus den Daten berechnet):
-- Ø Monatsgewinn: {avg_profit}
-- Cash (letzter Monat): {last_cash}
-- Runway (Monate): {runway}
-- Kostenquote (letzter Monat, Kosten/Umsatz): {cost_ratio}
-- Umsatz pro Mitarbeiter (letzter Monat): {rev_per_emp}
-- Umsatzwachstum (erstes -> letztes Monat): {rev_growth}
+- Ø Monatsgewinn: {k["avg_profit"]}
+- Cash (letzter Monat): {k["last_cash"]}
+- Runway (Monate): {k["runway"]}
+- Kostenquote (letzter Monat, Kosten/Umsatz): {k["cost_ratio"]}
+- Umsatz pro Mitarbeiter (letzter Monat): {k["rev_per_emp"]}
+- Umsatzwachstum (erstes -> letztes Monat): {k["rev_growth"]}
 
 Daten (letzte 6 Monate als CSV):
 {csv_preview}
@@ -318,7 +299,6 @@ with tab2:
 
 # Wenn Upload benutzt wurde, überschreibt es den Text
 if df_raw is None:
-    # Fallback: wenn schon mal Text geladen wurde, versuche daraus zu lesen
     if "csv_text" in st.session_state:
         try:
             df_raw = parse_csv_text(st.session_state["csv_text"])
@@ -393,7 +373,6 @@ if st.button("Empfehlung berechnen", type="primary"):
         audit_log(uname, model, rows_count, "ERROR", "other")
         st.stop()
 
-    # Call
     prompt = build_prompt(df, k)
 
     try:
@@ -413,20 +392,19 @@ if st.button("Empfehlung berechnen", type="primary"):
 
         audit_log(uname, model, rows_count, "OK", "none")
 
-    except AuthenticationError as e:
+    except AuthenticationError:
         st.error("OpenAI Fehler (401): Key ungültig/fehlende Berechtigung. Ohne gültigen Key keine Auswertung möglich.")
         audit_log(uname, model, rows_count, "ERROR", "401")
-    except RateLimitError as e:
+    except RateLimitError:
         st.error("OpenAI Fehler (429): Rate Limit erreicht. Ohne gültigen Key/Quota keine Auswertung möglich.")
         audit_log(uname, model, rows_count, "ERROR", "429")
-    except (BadRequestError, APIError) as e:
+    except (BadRequestError, APIError):
         st.error("OpenAI Fehler: Anfrage fehlgeschlagen. Ohne gültigen Key keine Auswertung möglich.")
         audit_log(uname, model, rows_count, "ERROR", "other")
-    except Exception as e:
+    except Exception:
         st.error("OpenAI Fehler: Unbekannter Fehler. Ohne gültigen Key keine Auswertung möglich.")
         audit_log(uname, model, rows_count, "ERROR", "other")
 
-# Optional: Audit-Log anzeigen (nur für Kursleiter nützlich)
 with st.expander("Audit-Log anzeigen (optional)"):
     adf = read_audit_df()
     st.dataframe(adf, use_container_width=True)
